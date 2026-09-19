@@ -1,20 +1,27 @@
 ---
 name: Feature request
 about: Suggest an idea for this project
-title: ''
-labels: ''
+title: "[FEATURE]"
+labels: enhancement
 assignees: ''
+type: Feature
 
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+## Problem / use case
+What problem would this feature solve?
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+## Proposed solution
+Describe how you think the feature should work.
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+## Example
+Show an example of the expected behavior, command or workflow.
 
-**Additional context**
-Add any other context or screenshots about the feature request here.
+## Alternatives considered
+Have you considered another solution?
+
+## Security considerations
+Could this feature affect encryption, authentication, vault storage or sensitive data?
+
+## Additional context
+Anything else relevant to the proposal.
