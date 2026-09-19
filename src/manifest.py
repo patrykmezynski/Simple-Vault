@@ -1,3 +1,9 @@
+"""Creation, serialization, encryption and validation of vault manifests.
+
+Original names, logical paths, hashes and filesystem metadata are kept inside the
+authenticated encrypted manifest rather than exposed through physical filenames.
+"""
+
 import json
 import secrets
 

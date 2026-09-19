@@ -1,3 +1,9 @@
+"""Click-based command-line interface for Python Vault.
+
+Commands in this module collect user input and delegate vault operations to
+``src.vault``. Sensitive passwords are prompted with hidden input by default.
+"""
+
 import click
 
 from src import vault as vault_api
@@ -441,6 +447,92 @@ def verify(name, password):
         click.echo(
             f"Vault verification failed: {e}"
         )
+
+@vault.command()
+@click.option(
+    "--name",
+    prompt="Vault name",
+    help="The name of the vault to export."
+)
+@click.option(
+    "--password",
+    prompt=True,
+    hide_input=True,
+    confirmation_prompt=False,
+    help="The password for the vault."
+)
+@click.option(
+    "--destination",
+    "--dest",
+    "destination",
+    prompt="Export destination",
+    default="exports",
+    show_default=True,
+    help="Directory where the TAR export and checksum will be saved."
+)
+def export(name, password, destination):
+    """Export one encrypted vault as a versioned TAR archive."""
+
+    try:
+        # Export creates both the TAR archive and its SHA-256 sidecar file.
+        result = vault_api.export_vault(
+            name,
+            password,
+            destination
+        )
+
+        click.echo(
+            f"Vault exported to: {result}"
+        )
+        click.echo(
+            f"Checksum saved to: {result}.sha256"
+        )
+
+    except Exception as e:
+        click.echo(
+            f"Error exporting vault: {e}"
+        )
+
+
+@vault.command(name="import")
+@click.option(
+    "--archive",
+    prompt="Export archive",
+    type=click.Path(
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        path_type=str
+    ),
+    help="Path to the exported TAR archive."
+)
+@click.option(
+    "--password",
+    prompt=True,
+    hide_input=True,
+    confirmation_prompt=False,
+    help="The password used to unlock and verify the imported vault."
+)
+def import_command(archive, password):
+    """Import and fully verify an exported vault archive."""
+
+    try:
+        # import_vault validates the checksum, TAR structure, encrypted
+        # metadata and every encrypted file before publishing the vault.
+        result = vault_api.import_vault(
+            archive,
+            password
+        )
+
+        click.echo(
+            f"Vault imported to: {result}"
+        )
+
+    except Exception as e:
+        click.echo(
+            f"Error importing vault: {e}"
+        )
+
 
 def _format_size(size: int) -> str:
     """

@@ -1,10 +1,22 @@
+"""High-level vault operations for creating, modifying, exporting and importing encrypted vaults.
+
+This module coordinates encrypted storage, manifest handling, integrity verification
+and safe import/export operations. Cryptographic primitives remain implemented in
+``src.crypto`` while manifest serialization is handled by ``src.manifest``.
+"""
+
 #standard library imports
 from pathlib import Path, PurePosixPath
 from hashlib import sha256
 from datetime import datetime
+from dataclasses import asdict
 
 import secrets
 import shutil
+import tarfile
+import io
+import json
+import tempfile
 
 #local imports
 from src import vault_config
@@ -14,6 +26,30 @@ from src import manifest as mf
 
 VAULT_ROOT = Path("vaults")
 
+def _calculate_file_sha256(file_path: Path) -> str:
+    """
+    Calculate SHA-256 hash of a file without loading
+    the entire file into memory.
+
+    Args:
+        file_path (Path): Path to the file.
+
+    Returns:
+        str: SHA-256 hash as hexadecimal string.
+    """
+
+    file_hash = sha256()
+
+    with file_path.open("rb") as f:
+        while True:
+            chunk = f.read(4 * 1024 * 1024)
+
+            if not chunk:
+                break
+
+            file_hash.update(chunk)
+
+    return file_hash.hexdigest()
 
 def _format_timestamp(timestamp: float) -> str:
     """Convert filesystem timestamp to ISO date."""
@@ -230,6 +266,835 @@ def _refresh_directory_metadata(
         key=lambda directory: directory.path
     )
 
+
+def _verify_vault_path(
+    vault_path: Path,
+    master_key: bytes,
+    vault_id: bytes,
+    manifest: vault_config.VaultManifest
+) -> vault_config.VaultVerifyResult:
+    """
+    Verify one unlocked vault directory without extracting plaintext files.
+
+    The caller provides an already authenticated manifest and the matching
+    master key and vault identifier. Every encrypted data blob is then
+    decrypted chunk by chunk in memory and checked against file metadata.
+
+    Args:
+        vault_path (Path): Physical vault directory to verify.
+        master_key (bytes): Unlocked vault master key.
+        vault_id (bytes): Authenticated random vault identifier.
+        manifest (vault_config.VaultManifest): Authenticated vault manifest.
+
+    Returns:
+        vault_config.VaultVerifyResult: Summary of successfully verified data.
+
+    Raises:
+        FileNotFoundError: If the vault data directory or a blob is missing.
+        ValueError: If metadata, file layout or cryptographic verification fails.
+    """
+
+    data_path = vault_path / "data"
+
+    if not data_path.exists() or not data_path.is_dir():
+        raise FileNotFoundError(
+            f"Vault data directory does not exist: '{data_path}'."
+        )
+
+    # Validate unique manifest fields before touching encrypted file data.
+    file_paths = [file.path for file in manifest.files]
+    storage_names = [file.storage_name for file in manifest.files]
+    file_ids = [file.file_id for file in manifest.files]
+    directory_paths = [directory.path for directory in manifest.directories]
+
+    if len(file_paths) != len(set(file_paths)):
+        raise ValueError("Manifest contains duplicate file paths.")
+
+    if len(storage_names) != len(set(storage_names)):
+        raise ValueError("Manifest contains duplicate storage names.")
+
+    if len(file_ids) != len(set(file_ids)):
+        raise ValueError("Manifest contains duplicate file identifiers.")
+
+    if len(directory_paths) != len(set(directory_paths)):
+        raise ValueError("Manifest contains duplicate directory paths.")
+
+    expected_storage_names = set()
+
+    for file in manifest.files:
+        # Revalidate logical paths before they are trusted by verification code.
+        if _normalize_vault_file_path(file.path) != file.path:
+            raise ValueError(
+                f"Manifest contains non-normalized file path: '{file.path}'."
+            )
+
+        # storage_name must be one plain file name inside data/.
+        storage_path = Path(file.storage_name)
+        if (
+            storage_path.name != file.storage_name
+            or "/" in file.storage_name
+            or "\\" in file.storage_name
+            or not file.storage_name.endswith(".enc")
+        ):
+            raise ValueError(
+                f"Invalid encrypted storage name: '{file.storage_name}'."
+            )
+
+        expected_storage_names.add(file.storage_name)
+
+        try:
+            file_id = bytes.fromhex(file.file_id)
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid file_id for '{file.path}'."
+            ) from e
+
+        encrypted_path = data_path / file.storage_name
+
+        # Verify complete encrypted file without writing plaintext to disk.
+        crypto.verify_file(
+            encrypted_path,
+            master_key,
+            vault_id,
+            file_id,
+            file.size,
+            file.sha256
+        )
+
+    # Detect orphan or unexpected files that are not referenced by manifest.
+    actual_storage_names = {
+        path.name
+        for path in data_path.iterdir()
+        if path.is_file()
+    }
+
+    if actual_storage_names != expected_storage_names:
+        missing = sorted(
+            expected_storage_names - actual_storage_names
+        )
+        unexpected = sorted(
+            actual_storage_names - expected_storage_names
+        )
+
+        details = []
+        if missing:
+            details.append(
+                "missing: " + ", ".join(missing)
+            )
+        if unexpected:
+            details.append(
+                "unexpected: " + ", ".join(unexpected)
+            )
+
+        raise ValueError(
+            "Vault data directory does not match manifest ("
+            + "; ".join(details)
+            + ")"
+        )
+
+    # Verify directory sizes against current logical file paths.
+    for directory in manifest.directories:
+        normalized_directory = _normalize_vault_file_path(
+            directory.path
+        )
+
+        if normalized_directory != directory.path:
+            raise ValueError(
+                f"Manifest contains non-normalized directory path: "
+                f"'{directory.path}'."
+            )
+
+        prefix = f"{directory.path}/"
+        calculated_size = sum(
+            file.size
+            for file in manifest.files
+            if file.path.startswith(prefix)
+        )
+
+        if directory.size != calculated_size:
+            raise ValueError(
+                f"Directory size does not match manifest files: "
+                f"'{directory.path}'."
+            )
+
+    return vault_config.VaultVerifyResult(
+        vault_name=manifest.vault_name,
+        file_count=manifest.file_count,
+        directory_count=manifest.directory_count,
+        total_size=manifest.size
+    )
+
+
+def export_vault(
+        vault_name: str,
+        password: str,
+        destination: str = "exports"
+) -> Path:
+    """
+    Export an existing vault to a TAR archive
+    in the selected destination directory.
+
+    Args:
+        vault_name (str): Name of the vault to export.
+        password (str): Password used to unlock the vault.
+        destination (str): Directory where the exported vault will be saved.
+                           Defaults to "exports".
+
+    Returns:
+        Path: Path to the exported TAR archive.
+
+    Raises:
+        FileNotFoundError: If the vault does not exist.
+        FileExistsError: If the export files already exist.
+        ValueError: If the password is invalid or the vault is corrupted.
+    """
+
+    # Find and unlock the requested vault.
+    vault_path, _, _, manifest = _find_vault(
+        vault_name,
+        password
+    )
+
+    destination_path = Path(destination)
+
+    # Create destination directory if needed.
+    destination_path.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # Use the random vault ID instead of exposing the vault name.
+    export_path = (
+        destination_path
+        / f"{vault_path.name}.tar"
+    )
+
+    hash_path = export_path.with_suffix(
+        export_path.suffix + ".sha256"
+    )
+
+    # Do not overwrite existing export files.
+    if export_path.exists():
+        raise FileExistsError(
+            f"Export path already exists: '{export_path}'"
+        )
+
+    if hash_path.exists():
+        raise FileExistsError(
+            f"Export hash already exists: '{hash_path}'"
+        )
+
+    # Create export metadata.
+    export_metadata = vault_config.VaultExportMetadata(
+        format=vault_config.VAULT_EXPORT_FORMAT,
+        version=vault_config.VAULT_EXPORT_VERSION,
+        vault_format_version=manifest.format_version,
+        vault_id=manifest.vault_id,
+        created_at=datetime.now().isoformat(timespec="seconds")
+    )
+
+    json_data = json.dumps(
+        asdict(export_metadata),
+        indent=4
+    ).encode("utf-8")
+
+    try:
+        # Create TAR archive containing the complete encrypted vault.
+        with tarfile.open(export_path, "w") as tar:
+
+            tar.add(
+                vault_path,
+                arcname=vault_path.name
+            )
+
+            # Create export metadata file inside TAR archive.
+            export_info = tarfile.TarInfo(
+                name="export.json"
+            )
+
+            export_info.size = len(json_data)
+
+            tar.addfile(
+                export_info,
+                io.BytesIO(json_data)
+            )
+
+        # Calculate SHA-256 of the complete export archive.
+        archive_hash = _calculate_file_sha256(
+            export_path
+        )
+
+        # Save archive hash next to the exported vault.
+        hash_path.write_text(
+            archive_hash,
+            encoding="utf-8"
+        )
+
+    except Exception:
+        # Remove incomplete export files if something failed.
+        if export_path.exists():
+            export_path.unlink()
+
+        if hash_path.exists():
+            hash_path.unlink()
+
+        raise
+
+    return export_path
+
+def import_vault(
+        archive: str,
+        password: str,
+) -> Path:
+    """
+    Import and verify an exported vault archive.
+
+    The archive checksum and export metadata are validated before extraction.
+    TAR members are checked for unsafe paths and unsupported entry types.
+    The vault is extracted into a temporary directory, cryptographically
+    verified and moved into the vault directory only after all checks pass.
+
+    Args:
+        archive (str): Path to the exported TAR archive.
+        password (str): Password used to unlock and verify the imported vault.
+
+    Returns:
+        Path: Path to the imported vault directory.
+
+    Raises:
+        FileNotFoundError: If archive or checksum file does not exist.
+        FileExistsError: If the vault already exists.
+        ValueError: If checksum, metadata, TAR structure or vault verification
+                    fails.
+    """
+
+    archive_path = Path(archive)
+
+    # Validate export archive path.
+    if not archive_path.exists():
+        raise FileNotFoundError(
+            f"Export archive does not exist: '{archive_path}'"
+        )
+
+    if not archive_path.is_file():
+        raise ValueError(
+            f"Export archive is not a file: '{archive_path}'"
+        )
+
+    # Locate checksum stored next to the export archive.
+    hash_path = archive_path.with_suffix(
+        archive_path.suffix + ".sha256"
+    )
+
+    if not hash_path.exists():
+        raise FileNotFoundError(
+            f"Export checksum does not exist: '{hash_path}'"
+        )
+
+    if not hash_path.is_file():
+        raise ValueError(
+            f"Export checksum is not a file: '{hash_path}'"
+        )
+
+    # The checksum sidecar should contain only one SHA-256 digest.
+    if hash_path.stat().st_size > 1024:
+        raise ValueError(
+            "Export checksum file is unexpectedly large."
+        )
+
+    expected_hash = hash_path.read_text(
+        encoding="utf-8"
+    ).strip()
+
+    if (
+        len(expected_hash) != 64
+        or any(
+            character not in "0123456789abcdefABCDEF"
+            for character in expected_hash
+        )
+    ):
+        raise ValueError(
+            "Export checksum contains an invalid SHA-256 digest."
+        )
+
+    actual_hash = _calculate_file_sha256(
+        archive_path
+    )
+
+    if not secrets.compare_digest(
+        actual_hash.lower(),
+        expected_hash.lower()
+    ):
+        raise ValueError(
+            "Export archive checksum verification failed."
+        )
+
+    # Read and validate export metadata before extracting anything.
+    try:
+        with tarfile.open(
+            archive_path,
+            "r:*"
+        ) as tar:
+
+            members = tar.getmembers()
+
+            if not members:
+                raise ValueError(
+                    "Export archive is empty."
+                )
+
+            member_names = [
+                member.name
+                for member in members
+            ]
+
+            if len(member_names) != len(set(member_names)):
+                raise ValueError(
+                    "Export archive contains duplicate entries."
+                )
+
+            export_members = [
+                member
+                for member in members
+                if member.name == "export.json"
+            ]
+
+            if len(export_members) != 1:
+                raise ValueError(
+                    "Export archive must contain exactly one export.json."
+                )
+
+            export_member = export_members[0]
+
+            if not export_member.isfile():
+                raise ValueError(
+                    "Export metadata entry is not a regular file."
+                )
+
+            # Prevent unreasonable metadata files from being loaded into memory.
+            if export_member.size > 64 * 1024:
+                raise ValueError(
+                    "Export metadata file is unexpectedly large."
+                )
+
+            export_file = tar.extractfile(
+                export_member
+            )
+
+            if export_file is None:
+                raise ValueError(
+                    "Export metadata file is invalid."
+                )
+
+            try:
+                export_data = json.loads(
+                    export_file.read().decode("utf-8")
+                )
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError
+            ) as e:
+                raise ValueError(
+                    "Export metadata contains invalid JSON."
+                ) from e
+
+    except tarfile.TarError as e:
+        raise ValueError(
+            "Export archive is not a valid TAR archive."
+        ) from e
+
+    if not isinstance(export_data, dict):
+        raise ValueError(
+            "Export metadata must contain a JSON object."
+        )
+
+    # Validate export format identifier.
+    if (
+        export_data.get("format")
+        != vault_config.VAULT_EXPORT_FORMAT
+    ):
+        raise ValueError(
+            "Unsupported export format."
+        )
+
+    # Validate export format version.
+    export_version = export_data.get(
+        "version"
+    )
+
+    if type(export_version) is not int:
+        raise ValueError(
+            "Export contains invalid export version."
+        )
+
+    if (
+        export_version
+        != vault_config.VAULT_EXPORT_VERSION
+    ):
+        raise ValueError(
+            f"Unsupported export version: {export_version}."
+        )
+
+    # Validate vault format version.
+    vault_format_version = export_data.get(
+        "vault_format_version"
+    )
+
+    if type(vault_format_version) is not int:
+        raise ValueError(
+            "Export contains invalid vault format version."
+        )
+
+    if (
+        vault_format_version
+        != vault_config.VAULT_FORMAT_VERSION
+    ):
+        raise ValueError(
+            f"Unsupported vault format version: "
+            f"{vault_format_version}."
+        )
+
+    # Validate random vault identifier.
+    vault_id = export_data.get(
+        "vault_id"
+    )
+
+    if not isinstance(vault_id, str) or not vault_id:
+        raise ValueError(
+            "Export contains invalid vault_id."
+        )
+
+    try:
+        vault_id_bytes = bytes.fromhex(
+            vault_id
+        )
+    except ValueError as e:
+        raise ValueError(
+            "Export contains invalid vault_id."
+        ) from e
+
+    if not vault_id_bytes:
+        raise ValueError(
+            "Export contains invalid vault_id."
+        )
+
+    created_at = export_data.get(
+        "created_at"
+    )
+
+    if not isinstance(created_at, str) or not created_at:
+        raise ValueError(
+            "Export contains invalid creation timestamp."
+        )
+
+    # Validate the complete TAR structure before extraction.
+    try:
+        with tarfile.open(
+            archive_path,
+            "r:*"
+        ) as tar:
+
+            members = tar.getmembers()
+
+            expected_root = vault_id
+
+            required_entries = {
+                expected_root,
+                f"{expected_root}/key.enc",
+                f"{expected_root}/manifest.enc",
+                f"{expected_root}/data",
+            }
+
+            archive_entries = {
+                member.name
+                for member in members
+            }
+
+            if not required_entries.issubset(
+                archive_entries
+            ):
+                raise ValueError(
+                    "Export archive is missing required vault files."
+                )
+
+            for member in members:
+
+                # export.json is the only allowed top-level metadata file.
+                if member.name == "export.json":
+                    if not member.isfile():
+                        raise ValueError(
+                            "export.json must be a regular file."
+                        )
+                    continue
+
+                # Backslashes could become path separators on Windows.
+                if "\\" in member.name:
+                    raise ValueError(
+                        f"Unsafe TAR path: '{member.name}'."
+                    )
+
+                raw_parts = member.name.split("/")
+
+                if any(
+                    part in ("", ".", "..")
+                    for part in raw_parts
+                ):
+                    raise ValueError(
+                        f"Unsafe TAR path: '{member.name}'."
+                    )
+
+                path = PurePosixPath(
+                    member.name
+                )
+
+                if path.is_absolute():
+                    raise ValueError(
+                        f"Absolute TAR path is not allowed: "
+                        f"'{member.name}'."
+                    )
+
+                parts = path.parts
+
+                # Everything except export.json must be stored inside
+                # the vault_id directory.
+                if (
+                    not parts
+                    or parts[0] != expected_root
+                ):
+                    raise ValueError(
+                        f"Unexpected TAR entry: '{member.name}'."
+                    )
+
+                # Reject symbolic links, hard links, devices, FIFOs and
+                # any other unsupported TAR entry type.
+                if not (
+                    member.isfile()
+                    or member.isdir()
+                ):
+                    raise ValueError(
+                        f"Unsupported TAR entry type: "
+                        f"'{member.name}'."
+                    )
+
+                # Root vault directory.
+                if len(parts) == 1:
+                    if not member.isdir():
+                        raise ValueError(
+                            "Vault root entry must be a directory."
+                        )
+                    continue
+
+                # key.enc and manifest.enc.
+                if (
+                    len(parts) == 2
+                    and parts[1] in (
+                        "key.enc",
+                        "manifest.enc"
+                    )
+                ):
+                    if not member.isfile():
+                        raise ValueError(
+                            f"Vault entry must be a regular file: "
+                            f"'{member.name}'."
+                        )
+                    continue
+
+                # data directory.
+                if (
+                    len(parts) == 2
+                    and parts[1] == "data"
+                ):
+                    if not member.isdir():
+                        raise ValueError(
+                            "Vault data entry must be a directory."
+                        )
+                    continue
+
+                # Encrypted file blobs may exist only directly inside data/.
+                if (
+                    len(parts) == 3
+                    and parts[1] == "data"
+                ):
+                    if not member.isfile():
+                        raise ValueError(
+                            f"Encrypted vault blob must be a regular file: "
+                            f"'{member.name}'."
+                        )
+
+                    if not parts[2].endswith(".enc"):
+                        raise ValueError(
+                            f"Invalid encrypted vault blob: "
+                            f"'{member.name}'."
+                        )
+
+                    continue
+
+                raise ValueError(
+                    f"Unexpected TAR entry: '{member.name}'."
+                )
+
+    except tarfile.TarError as e:
+        raise ValueError(
+            "Export archive structure could not be validated."
+        ) from e
+
+    # Prevent overwriting an already imported vault.
+    final_vault_path = (
+        VAULT_ROOT
+        / vault_id
+    )
+
+    if final_vault_path.exists():
+        raise FileExistsError(
+            f"Vault '{vault_id}' already exists."
+        )
+
+    VAULT_ROOT.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # Extract inside VAULT_ROOT so the final rename remains on the same
+    # filesystem and can be performed atomically.
+    with tempfile.TemporaryDirectory(
+        prefix=".vault-import-",
+        dir=VAULT_ROOT
+    ) as temporary_directory:
+
+        staging_root = Path(
+            temporary_directory
+        )
+
+        try:
+            # Extract only already validated regular files and directories.
+            with tarfile.open(
+                archive_path,
+                "r:*"
+            ) as tar:
+
+                for member in tar.getmembers():
+
+                    if member.name == "export.json":
+                        continue
+
+                    parts = PurePosixPath(
+                        member.name
+                    ).parts
+
+                    target_path = staging_root.joinpath(
+                        *parts
+                    )
+
+                    if member.isdir():
+                        target_path.mkdir(
+                            parents=True,
+                            exist_ok=True
+                        )
+                        continue
+
+                    target_path.parent.mkdir(
+                        parents=True,
+                        exist_ok=True
+                    )
+
+                    source_file = tar.extractfile(
+                        member
+                    )
+
+                    if source_file is None:
+                        raise ValueError(
+                            f"Could not read TAR entry: "
+                            f"'{member.name}'."
+                        )
+
+                    with target_path.open(
+                        "xb"
+                    ) as output_file:
+                        shutil.copyfileobj(
+                            source_file,
+                            output_file,
+                            length=4 * 1024 * 1024
+                        )
+
+        except tarfile.TarError as e:
+            raise ValueError(
+                "Export archive extraction failed."
+            ) from e
+
+        staged_vault_path = (
+            staging_root
+            / vault_id
+        )
+
+        if (
+            not staged_vault_path.exists()
+            or not staged_vault_path.is_dir()
+        ):
+            raise ValueError(
+                "Imported vault directory is missing."
+            )
+
+        # Unlock key.enc and authenticate manifest.enc.
+        master_key, real_vault_id, manifest = _unlock_vault_path(
+            staged_vault_path,
+            password
+        )
+
+        real_vault_id_hex = real_vault_id.hex()
+
+        # The external metadata, key file, manifest and folder must all
+        # reference the same random vault identifier.
+        if real_vault_id_hex != vault_id:
+            raise ValueError(
+                "Export vault_id does not match encrypted key metadata."
+            )
+
+        if manifest.vault_id != real_vault_id_hex:
+            raise ValueError(
+                "Manifest vault_id does not match encrypted key metadata."
+            )
+
+        if (
+            manifest.format_version
+            != vault_format_version
+        ):
+            raise ValueError(
+                "Vault format version does not match export metadata."
+            )
+
+        # Verify the complete imported vault before publishing it.
+        _verify_vault_path(
+            staged_vault_path,
+            master_key,
+            real_vault_id,
+            manifest
+        )
+
+        # Avoid creating another vault with the same decrypted name and password.
+        try:
+            _find_vault(
+                manifest.vault_name,
+                password
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                f"Vault '{manifest.vault_name}' already exists."
+            )
+
+        # Check again immediately before publishing the imported vault.
+        if final_vault_path.exists():
+            raise FileExistsError(
+                f"Vault '{vault_id}' already exists."
+            )
+
+        # Atomically publish the fully verified vault.
+        staged_vault_path.rename(
+            final_vault_path
+        )
+
+    return final_vault_path
 
 def create_vault(vault_name: str, password: str, source: str) -> bool:
     """
@@ -760,10 +1625,9 @@ def verify_vault(
     """
     Verify the complete encrypted vault without extracting plaintext files.
 
-    key.enc and manifest.enc are authenticated while the vault is unlocked.
-    Every encrypted data blob is then decrypted chunk by chunk in memory and
-    checked against vault_id, file_id, size, AES-GCM tags and plaintext SHA-256.
-    The data directory must contain exactly the blobs referenced by manifest.
+    The vault is unlocked and its authenticated manifest is loaded first.
+    Shared path-based verification then validates every encrypted blob, logical
+    path, directory size and manifest-to-data relationship.
 
     Args:
         vault_name (str): Name of the vault to verify.
@@ -782,134 +1646,11 @@ def verify_vault(
         password
     )
 
-    data_path = vault_path / "data"
-
-    if not data_path.exists() or not data_path.is_dir():
-        raise FileNotFoundError(
-            f"Vault data directory does not exist: '{data_path}'."
-        )
-
-    # Validate unique manifest fields before touching encrypted file data.
-    file_paths = [file.path for file in manifest.files]
-    storage_names = [file.storage_name for file in manifest.files]
-    file_ids = [file.file_id for file in manifest.files]
-    directory_paths = [directory.path for directory in manifest.directories]
-
-    if len(file_paths) != len(set(file_paths)):
-        raise ValueError("Manifest contains duplicate file paths.")
-
-    if len(storage_names) != len(set(storage_names)):
-        raise ValueError("Manifest contains duplicate storage names.")
-
-    if len(file_ids) != len(set(file_ids)):
-        raise ValueError("Manifest contains duplicate file identifiers.")
-
-    if len(directory_paths) != len(set(directory_paths)):
-        raise ValueError("Manifest contains duplicate directory paths.")
-
-    expected_storage_names = set()
-
-    for file in manifest.files:
-        # Revalidate logical paths before they are trusted by verification code.
-        if _normalize_vault_file_path(file.path) != file.path:
-            raise ValueError(
-                f"Manifest contains non-normalized file path: '{file.path}'."
-            )
-
-        # storage_name must be one plain file name inside data/.
-        storage_path = Path(file.storage_name)
-        if (
-            storage_path.name != file.storage_name
-            or "/" in file.storage_name
-            or "\\" in file.storage_name
-            or not file.storage_name.endswith(".enc")
-        ):
-            raise ValueError(
-                f"Invalid encrypted storage name: '{file.storage_name}'."
-            )
-
-        expected_storage_names.add(file.storage_name)
-
-        try:
-            file_id = bytes.fromhex(file.file_id)
-        except ValueError as e:
-            raise ValueError(
-                f"Invalid file_id for '{file.path}'."
-            ) from e
-
-        encrypted_path = data_path / file.storage_name
-
-        # Verify complete encrypted file without writing plaintext to disk.
-        crypto.verify_file(
-            encrypted_path,
-            master_key,
-            vault_id,
-            file_id,
-            file.size,
-            file.sha256
-        )
-
-    # Detect orphan or unexpected files that are not referenced by manifest.
-    actual_storage_names = {
-        path.name
-        for path in data_path.iterdir()
-        if path.is_file()
-    }
-
-    if actual_storage_names != expected_storage_names:
-        missing = sorted(
-            expected_storage_names - actual_storage_names
-        )
-        unexpected = sorted(
-            actual_storage_names - expected_storage_names
-        )
-
-        details = []
-        if missing:
-            details.append(
-                "missing: " + ", ".join(missing)
-            )
-        if unexpected:
-            details.append(
-                "unexpected: " + ", ".join(unexpected)
-            )
-
-        raise ValueError(
-            "Vault data directory does not match manifest ("
-            + "; ".join(details)
-            + ")."
-        )
-
-    # Verify directory sizes against current logical file paths.
-    for directory in manifest.directories:
-        normalized_directory = _normalize_vault_file_path(
-            directory.path
-        )
-
-        if normalized_directory != directory.path:
-            raise ValueError(
-                f"Manifest contains non-normalized directory path: "
-                f"'{directory.path}'."
-            )
-
-        prefix = f"{directory.path}/"
-        calculated_size = sum(
-            file.size
-            for file in manifest.files
-            if file.path.startswith(prefix)
-        )
-
-        if directory.size != calculated_size:
-            raise ValueError(
-                f"Directory size does not match manifest files: "
-                f"'{directory.path}'."
-            )
-
-    return vault_config.VaultVerifyResult(
-        vault_name=manifest.vault_name,
-        file_count=manifest.file_count,
-        directory_count=manifest.directory_count,
-        total_size=manifest.size
+    return _verify_vault_path(
+        vault_path,
+        master_key,
+        vault_id,
+        manifest
     )
 
 def extract_file(
@@ -1087,253 +1828,3 @@ def _scan_source(
             )
 
     return files, directories
-
-
-def test():
-    """Run create, open, add, rename, remove, extract, verify and password tests."""
-
-    vault_name = f"TestVault-{secrets.token_hex(4)}"
-    password = "password123"
-    output_path = Path("test_output")
-    vault_path = None
-
-    if output_path.exists(): # Remove previous extraction output.
-        shutil.rmtree(output_path)
-
-    try: # Testing _scan_source
-        files, directories = _scan_source("test")
-
-        assert isinstance(files, list)
-        assert isinstance(directories, list)
-
-        print("[PASSED] _scan_source")
-
-    except Exception as e:
-        print(
-            f"[FAILED] _scan_source: Error occurred: {e}"
-        )
-
-    try: # Testing create_vault
-        result = create_vault(
-            vault_name,
-            password,
-            "test"
-        )
-
-        assert result is True
-
-        vault_path, _, _, _ = _find_vault(
-            vault_name,
-            password
-        )
-
-        assert (vault_path / "key.enc").exists()
-        assert (vault_path / "manifest.enc").exists()
-        assert (vault_path / "data").exists()
-        assert vault_path.name != sha256(
-            vault_name.encode("utf-8")
-        ).hexdigest()
-
-        print("[PASSED] create_vault")
-
-    except Exception as e:
-        print(
-            f"[FAILED] create_vault: Error occurred: {e}"
-        )
-
-    try: # Testing open_vault
-        result = open_vault(
-            vault_name,
-            password
-        )
-
-        assert isinstance(result, vault_config.VaultManifest)
-        assert result.vault_name == vault_name
-        assert result.file_count > 0
-        assert all(file.file_id for file in result.files)
-        assert all(len(file.sha256) == 64 for file in result.files)
-
-        print("[PASSED] open_vault")
-
-    except Exception as e:
-        print(
-            f"[FAILED] open_vault: Error occurred: {e}"
-        )
-
-    try: # Testing add_file
-        added = add_file(
-            vault_name,
-            password,
-            "test/test.txt",
-            "added/test_copy.txt"
-        )
-
-        manifest = open_vault(vault_name, password)
-
-        assert added.path == "added/test_copy.txt"
-        assert any(
-            file.path == "added/test_copy.txt"
-            for file in manifest.files
-        )
-
-        print("[PASSED] add_file")
-
-    except Exception as e:
-        print(
-            f"[FAILED] add_file: Error occurred: {e}"
-        )
-
-    try: # Testing rename_file
-        renamed = rename_file(
-            vault_name,
-            password,
-            "added/test_copy.txt",
-            "renamed/test_copy.txt"
-        )
-
-        manifest = open_vault(vault_name, password)
-
-        assert renamed.path == "renamed/test_copy.txt"
-        assert any(
-            file.path == "renamed/test_copy.txt"
-            for file in manifest.files
-        )
-
-        print("[PASSED] rename_file")
-
-    except Exception as e:
-        print(
-            f"[FAILED] rename_file: Error occurred: {e}"
-        )
-
-    try: # Testing remove_file
-        remove_file(
-            vault_name,
-            password,
-            "renamed/test_copy.txt"
-        )
-
-        manifest = open_vault(vault_name, password)
-
-        assert not any(
-            file.path == "renamed/test_copy.txt"
-            for file in manifest.files
-        )
-
-        print("[PASSED] remove_file")
-
-    except Exception as e:
-        print(
-            f"[FAILED] remove_file: Error occurred: {e}"
-        )
-
-    try: # Testing extract_file
-        manifest = open_vault(
-            vault_name,
-            password
-        )
-
-        if manifest.files:
-            selected_file = manifest.files[0]
-
-            extracted_path = extract_file(
-                vault_name,
-                password,
-                selected_file.path,
-                str(output_path)
-            )
-
-            assert extracted_path.exists()
-            assert sha256(
-                extracted_path.read_bytes()
-            ).hexdigest() == selected_file.sha256
-
-        print("[PASSED] extract_file")
-
-    except Exception as e:
-        print(
-            f"[FAILED] extract_file: Error occurred: {e}"
-        )
-
-    try: # Testing verify_vault
-        verification = verify_vault(
-            vault_name,
-            password
-        )
-
-        assert isinstance(
-            verification,
-            vault_config.VaultVerifyResult
-        )
-        assert verification.vault_name == vault_name
-        assert verification.file_count > 0
-
-        print("[PASSED] verify_vault")
-
-    except Exception as e:
-        print(
-            f"[FAILED] verify_vault: Error occurred: {e}"
-        )
-
-    try: # Testing change_password
-        new_password = "password456"
-
-        change_password(
-            vault_name,
-            password,
-            new_password
-        )
-
-        # Old password must no longer unlock the vault.
-        try:
-            open_vault(vault_name, password)
-        except FileNotFoundError:
-            pass
-        else:
-            raise AssertionError(
-                "Old password still unlocks the vault."
-            )
-
-        manifest = open_vault(
-            vault_name,
-            new_password
-        )
-
-        assert manifest.vault_name == vault_name
-
-        password = new_password
-
-        print("[PASSED] change_password")
-
-    except Exception as e:
-        print(
-            f"[FAILED] change_password: Error occurred: {e}"
-        )
-
-    try: # Testing list_vaults
-        locked_entries = list_vaults()
-        unlocked_entries = list_vaults(password)
-
-        assert any(
-            entry.vault_id == vault_path.name
-            for entry in locked_entries
-        )
-        assert any(
-            entry.vault_name == vault_name
-            and entry.unlocked
-            for entry in unlocked_entries
-        )
-
-        print("[PASSED] list_vaults")
-
-    except Exception as e:
-        print(
-            f"[FAILED] list_vaults: Error occurred: {e}"
-        )
-
-    finally: # Clean up after test.
-        if vault_path is not None and vault_path.exists():
-            shutil.rmtree(vault_path)
-
-        if output_path.exists():
-            shutil.rmtree(output_path)
