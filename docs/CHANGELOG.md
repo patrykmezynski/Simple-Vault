@@ -7,6 +7,8 @@ and this project intends to follow semantic versioning once formal releases begi
 
 ## [Unreleased]
 
+## [0.0.2-alpha] - 2026-09-20
+
 ### Added
 
 - Versioned vault export format based on TAR archives.
