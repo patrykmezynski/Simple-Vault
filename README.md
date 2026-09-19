@@ -165,4 +165,6 @@ The core vault format and basic file operations are implemented, but the project
 
 ## License
 
-No license has been selected yet.
+This project is licensed under the MIT License.
+
+See the [LICENSE](LICENSE) file for details.
