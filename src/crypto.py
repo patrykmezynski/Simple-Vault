@@ -1,3 +1,9 @@
+"""Cryptographic primitives and versioned binary formats used by Python Vault.
+
+The module owns key derivation, key wrapping, authenticated manifest encryption,
+and chunked authenticated file encryption and verification.
+"""
+
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM

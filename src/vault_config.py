@@ -1,5 +1,17 @@
+"""Shared format constants and dataclasses used by the vault API.
+
+Keeping these models in one module gives import, export, manifest handling and the
+CLI a common description of vault metadata and versioned export metadata.
+"""
+
 from dataclasses import dataclass
 
+# Public export container identifier and version.
+VAULT_EXPORT_FORMAT = "vault-export"
+VAULT_EXPORT_VERSION = 1
+
+# Logical vault format version supported by the current importer.
+VAULT_FORMAT_VERSION = 1
 
 @dataclass
 class FileEntry:
@@ -98,3 +110,13 @@ class VaultVerifyResult:
 
     # Total plaintext size of all verified files in bytes.
     total_size: int
+
+@dataclass
+class VaultExportMetadata:
+    """Metadata describing one exported vault archive."""
+
+    format: str
+    version: int
+    vault_format_version: int
+    vault_id: str
+    created_at: str

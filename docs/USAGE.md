@@ -1,6 +1,6 @@
 # Python Vault Usage
 
-This document contains command usage and examples for Python Vault.
+This document describes the current Python Vault CLI and Python API.
 
 The CLI entry point is `main.py`.
 
@@ -24,17 +24,21 @@ py main.py rename --help
 py main.py extract --help
 py main.py change-password --help
 py main.py verify --help
+py main.py export --help
+py main.py import --help
 ```
+
+Passwords are prompted with hidden input unless they are explicitly supplied as CLI arguments.
 
 ## Create a Vault
 
-Create a new vault from a source directory:
+Create a new encrypted vault from a source directory:
 
 ```powershell
 py main.py create
 ```
 
-The program will ask for:
+The program asks for:
 
 ```text
 Vault name:
@@ -43,13 +47,11 @@ Repeat for confirmation:
 Source folder:
 ```
 
-You can also provide some arguments directly:
+You can also provide non-secret arguments directly:
 
 ```powershell
 py main.py create --name MyVault --source "G:\Documents"
 ```
-
-The password is still requested through hidden input.
 
 A newly created vault is stored inside:
 
@@ -57,11 +59,11 @@ A newly created vault is stored inside:
 vaults/<random_vault_id>/
 ```
 
-The original vault name is stored only inside encrypted metadata.
+The original vault name is kept only inside encrypted metadata.
 
 ## Open a Vault
 
-Open the encrypted manifest and display the file list:
+Open the authenticated encrypted manifest and display stored files:
 
 ```powershell
 py main.py open
@@ -83,29 +85,27 @@ Vault: MyVault
          10 B  folder/test.txt
 ```
 
-Opening a vault does not decrypt all stored files. Only the encrypted metadata required to display the vault contents is opened.
+Opening a vault does not decrypt every stored file. Only the master key and encrypted manifest required to display metadata are opened.
 
 ## List Vaults
 
-List available vault containers:
+List physical vault containers without revealing encrypted names:
 
 ```powershell
 py main.py list
 ```
 
-Because vault names are encrypted, locked vaults cannot expose their original names without being unlocked.
-
-If the CLI supports unlocked listing, use:
+To attempt to unlock names using a password:
 
 ```powershell
 py main.py list --unlock
 ```
 
-The command may request a password and display names only for vaults that can be successfully unlocked with that password.
+Only vaults that can be successfully authenticated with the supplied password reveal their original names.
 
 ## Add a File
 
-Add a single file without rebuilding the entire vault:
+Add one file without rebuilding the complete vault:
 
 ```powershell
 py main.py add
@@ -117,11 +117,11 @@ Example:
 py main.py add --name MyVault --source "G:\file.txt" --path "docs/file.txt"
 ```
 
-The source file is encrypted separately and added to the vault data directory. The encrypted manifest is then updated.
+The new file receives an independent random file identifier and encrypted storage name. Existing encrypted blobs remain unchanged.
 
 ## Remove a File
 
-Remove a single file from the vault:
+Remove one logical file:
 
 ```powershell
 py main.py remove
@@ -133,11 +133,11 @@ Example:
 py main.py remove --name MyVault --file "docs/file.txt"
 ```
 
-The encrypted blob belonging to the selected file is removed and the manifest is updated.
+The selected encrypted blob is removed only after the updated authenticated manifest is safely written.
 
-## Rename a File
+## Rename or Move a File
 
-Rename or move a file inside the logical vault structure:
+Rename or move one logical file:
 
 ```powershell
 py main.py rename
@@ -149,11 +149,11 @@ Example:
 py main.py rename --name MyVault --file "docs/file.txt" --new-path "archive/file.txt"
 ```
 
-The encrypted file data does not need to be rewritten. Only the encrypted manifest is updated.
+File contents are not decrypted or re-encrypted. Only authenticated manifest metadata changes.
 
 ## Extract One File
 
-Extract a selected file:
+Extract one selected file:
 
 ```powershell
 py main.py extract
@@ -165,17 +165,17 @@ Example:
 py main.py extract --name MyVault --file "folder/test.txt" --destination output
 ```
 
-The extracted file will be written as:
+The logical vault path is recreated under the selected destination:
 
 ```text
 output/folder/test.txt
 ```
 
-Before the final file is published, the implementation verifies authenticated encryption data and the expected SHA-256 hash.
+Plaintext is published only after authenticated decryption, size checks and SHA-256 verification succeed.
 
 ## Change the Password
 
-Change the vault password:
+Change the password protecting an existing vault:
 
 ```powershell
 py main.py change-password
@@ -183,56 +183,128 @@ py main.py change-password
 
 The operation:
 
-1. unlocks the vault using the current password,
-2. keeps the existing random master key,
-3. derives a new wrapping key from the new password,
-4. creates a new encrypted `key.enc`.
+1. authenticates the current password,
+2. unlocks the existing random master key,
+3. derives a fresh wrapping key from the new password and a fresh Scrypt salt,
+4. writes and verifies a replacement `key.enc`,
+5. atomically replaces the old wrapped key.
 
-Stored files and `manifest.enc` do not need to be re-encrypted.
-
-This means password changes remain fast even for very large vaults.
+`manifest.enc` and encrypted files do not need to be re-encrypted.
 
 ## Verify a Vault
 
-Verify the complete vault:
+Verify the complete vault without permanently extracting plaintext:
 
 ```powershell
 py main.py verify
 ```
 
-Verification checks the encrypted structure and stored files, including:
+Verification checks:
 
-- `key.enc`,
-- `manifest.enc`,
-- vault identifiers,
-- file identifiers,
-- AES-GCM authentication,
-- chunk ordering,
-- chunk sizes,
-- complete file sizes,
+- `key.enc` authentication,
+- `manifest.enc` authentication,
+- vault and file identifiers,
+- duplicate manifest entries,
+- encrypted storage names,
+- AES-GCM authentication for every file chunk,
+- chunk order and sizes,
+- complete plaintext size,
 - SHA-256 values,
 - missing encrypted blobs,
-- unexpected/orphan encrypted blobs.
+- unexpected/orphan encrypted blobs,
+- logical directory size metadata.
 
-The verifier processes file data in chunks and does not need to permanently extract every file.
+## Export a Vault
+
+Export an encrypted vault as a versioned TAR archive:
+
+```powershell
+py main.py export
+```
+
+Or provide the destination directly:
+
+```powershell
+py main.py export --name MyVault --destination exports
+```
+
+`--dest` is accepted as a shorter alias for `--destination`.
+
+The command creates:
+
+```text
+exports/<random_vault_id>.tar
+exports/<random_vault_id>.tar.sha256
+```
+
+The TAR contains:
+
+```text
+export.json
+<random_vault_id>/
+├── key.enc
+├── manifest.enc
+└── data/
+    └── *.enc
+```
+
+`export.json` contains only public technical metadata required for compatibility checks. It does not expose the original vault name or original file paths.
+
+The `.sha256` file detects accidental archive corruption or incomplete transfer. It is not an attacker-authenticated signature because anyone able to replace both the TAR and sidecar could recompute the checksum. The importer therefore performs full authenticated verification of the encrypted vault before publishing it.
+
+Existing export files are never silently overwritten.
+
+## Import a Vault
+
+Import an export created by Python Vault:
+
+```powershell
+py main.py import
+```
+
+Or:
+
+```powershell
+py main.py import --archive "exports\<vault_id>.tar"
+```
+
+The matching `<vault_id>.tar.sha256` file must be present next to the archive.
+
+Import performs the following checks before the vault becomes available:
+
+1. archive and checksum files exist,
+2. the complete TAR SHA-256 matches the sidecar,
+3. `export.json` exists and contains valid JSON,
+4. export format and vault format versions are supported,
+5. `vault_id` is valid,
+6. TAR entries are unique and follow the expected layout,
+7. absolute paths and `..` path traversal are rejected,
+8. symbolic links, hard links, device nodes, FIFOs and unsupported TAR entries are rejected,
+9. extraction occurs only inside a temporary staging directory,
+10. `key.enc` and `manifest.enc` authenticate with the supplied password,
+11. encrypted metadata uses the same `vault_id` as the export,
+12. every encrypted file is cryptographically verified,
+13. missing and unexpected encrypted blobs are rejected,
+14. an existing vault is never overwritten,
+15. the fully verified staged directory is atomically moved into `vaults/`.
+
+A wrong password or any integrity failure leaves no partially imported vault behind.
 
 ## Use from Python
 
-### Create a Vault
+### Create
 
 ```python
 from src import vault as v
 
-result = v.create_vault(
+created = v.create_vault(
     "MyVault",
     "password123",
     "test"
 )
-
-print(result)
 ```
 
-### Open a Vault
+### Open
 
 ```python
 from src import vault as v
@@ -246,7 +318,7 @@ for file in manifest.files:
     print(file.path, file.size)
 ```
 
-### Extract a File
+### Extract
 
 ```python
 from src import vault as v
@@ -257,13 +329,32 @@ output_path = v.extract_file(
     "folder/test.txt",
     "output"
 )
+```
 
-print(output_path)
+### Export
+
+```python
+from src import vault as v
+
+archive_path = v.export_vault(
+    "MyVault",
+    "password123",
+    "exports"
+)
+```
+
+### Import
+
+```python
+from src import vault as v
+
+vault_path = v.import_vault(
+    "exports/<vault_id>.tar",
+    "password123"
+)
 ```
 
 ## Internal Vault Layout
-
-A vault currently uses a layout similar to:
 
 ```text
 vaults/
@@ -272,20 +363,19 @@ vaults/
     ├── manifest.enc
     └── data/
         ├── random_name.enc
-        ├── random_name.enc
-        └── random_name.enc
+        └── ...
 ```
 
 ### `key.enc`
 
-Contains the vault master key protected with a password-derived wrapping key.
+Contains the random vault master key protected using a password-derived wrapping key.
 
 ### `manifest.enc`
 
-Contains encrypted metadata such as:
+Contains authenticated encrypted metadata including:
 
 - vault name,
-- original file paths,
+- logical file paths,
 - encrypted storage names,
 - file identifiers,
 - sizes,
@@ -294,24 +384,20 @@ Contains encrypted metadata such as:
 
 ### `data/`
 
-Contains separately encrypted file blobs.
-
-Original file names are not used as physical file names in this directory.
+Contains independently encrypted file blobs. Original file names are not used as physical storage names.
 
 ## Tests
 
-Run:
+Run the regression suite:
 
 ```powershell
 py test.py
 ```
 
-The project tests currently cover the primary vault operations and selected security failure cases.
+The tests are isolated in temporary directories and cover successful operations plus import/export corruption and hostile TAR scenarios. `src/vault.py` contains production vault logic only; the test runner lives entirely in `test.py`.
 
 ## Security Notice
 
-Python Vault is an educational project under active development.
+Python Vault is an educational and experimental project under active development.
 
-Although it uses established cryptographic primitives, the complete design and implementation have not undergone a professional independent security audit.
-
-Do not rely on it as the only protection for critical or irreplaceable data.
+Although it uses established cryptographic primitives, the complete architecture and implementation have not undergone a professional independent security audit. Do not rely on it as the only protection for critical data.
